@@ -1,3 +1,5 @@
+import torch
+from torch import nn
 from transformers import PretrainedConfig
 
 # 继承Hugging Face transformers库中的 PretrainedConfig，可无缝使用 Hugging Face 的模型存储、加载、from_pretrained 等工具
@@ -70,3 +72,19 @@ class MicroMindConfig(PretrainedConfig):
             if self.inference_rope_scaling
             else None
         )
+# 标准化层，使用RMSNorm代替LayerNorm
+class RMSNorm(nn.Module):
+    def __init__(self,dim:int,eps:float=1e-5):
+        super().__init__()
+        self.dim=dim
+        self.eps=eps
+        self.weight=nn.Parameter(torch.ones(dim))
+    # 在 Transformer 模型中，一个批次的数据通常表示为[batch_size, seq_len, d_model]
+    # 归一化（无论是 LayerNorm 还是 RMSNorm）的目标是：让每个 token 的特征向量具有稳定的分布，
+    # 即特征维度上的各个分量被重新缩放，使它们的均方根（或均值/方差）标准化。
+    # 因此，归一化操作必须沿着特征维度（即最后一维 dim=-1） 进行统计计算（均值、方差、RMS 等）
+    def norm(self,x):
+        return x*torch.rsqrt_(x.pow(2).mean(-1,keepdim=True)+self.eps)
+    def forward(self,x):
+        return (self.weight * self.norm(x.float())).type_as(x)
+
