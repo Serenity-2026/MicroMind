@@ -1,6 +1,10 @@
+import torch
+
+
 def print_hi(name):
+    a = torch.Tensor([1.0, 2.0, 3.0])[:2]
     # 在下面的代码行中使用断点来调试脚本。
-    print(f'Hi, {name}')  # 按 Ctrl+F8 切换断点。
+    print(a)  # 按 Ctrl+F8 切换断点。
 
 
 # 按装订区域中的绿色按钮以运行脚本。

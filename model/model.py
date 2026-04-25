@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -87,4 +89,11 @@ class RMSNorm(nn.Module):
         return x*torch.rsqrt_(x.pow(2).mean(-1,keepdim=True)+self.eps)
     def forward(self,x):
         return (self.weight * self.norm(x.float())).type_as(x)
-
+#通过YaRN算法实现对旋转位置编码（RoPE）频率的预计算与扩展
+# dim:模型 hidden size（通常是 attention head 的维度，必须是偶数）
+# end:预计算的最大位置索引，默认 32768。
+def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
+    # 计算基础角频率,**幂运算,//地板除法
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    # 温度因子
+    attn_factor=1.0
