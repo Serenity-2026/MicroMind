@@ -89,7 +89,7 @@ class RMSNorm(nn.Module):
         return x*torch.rsqrt_(x.pow(2).mean(-1,keepdim=True)+self.eps)
     def forward(self,x):
         return (self.weight * self.norm(x.float())).type_as(x)
-#通过YaRN算法实现对旋转位置编码（RoPE）频率的预计算与扩展
+# 通过YaRN算法实现对旋转位置编码（RoPE）频率的预计算与扩展,按照低中高维分类讨论
 # dim:模型 hidden size（通常是 attention head 的维度，必须是偶数）
 # end:预计算的最大位置索引，默认 32768。
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
@@ -97,3 +97,23 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
     freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     # 温度因子
     attn_factor=1.0
+    # 加载核心参数
+    if rope_scaling is not None:  # YaRN核心公式，将原始频率f(i) 通过一个线性插值因子 γ（范围 0~1）和缩放因子s（即 factor）来修改。
+        # 原始支持的最大位置数,放大因子,高频低维阈值,低频高维阈值,温度因子
+        orig_max, factor, beta_fast, beta_slow, attn_factor = (
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 16),
+            rope_scaling.get("beta_fast", 32.0),
+            rope_scaling.get("beta_slow", 1.0),
+            rope_scaling.get("attention_factor", 1.0)
+        )
+        # 超过预设范围才会使用YaRN外推
+        if end / orig_max > 1.0:
+                    # 计算波长b对应的维度,匿名函数，波长=2π/θ越短,θ越大,频率越高,维度越低
+                    inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+                    # 计算高低频边界
+                    low, high = (max(math.floor(inv_dim(beta_fast)), 0),
+                                 min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1))
+                    ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
+                    freqs = freqs * (1 - ramp + ramp / factor)
+
