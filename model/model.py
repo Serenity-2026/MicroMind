@@ -98,7 +98,8 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
     # 温度因子
     attn_factor=1.0
     # 加载核心参数
-    if rope_scaling is not None:  # YaRN核心公式，将原始频率f(i) 通过一个线性插值因子 γ（范围 0~1）和缩放因子s（即 factor）来修改。
+    # YaRN核心公式，将原始频率f(i) 通过一个线性插值因子 γ（范围 0~1）和缩放因子s（即 factor）来修改。
+    if rope_scaling is not None:
         # 原始支持的最大位置数,放大因子,高频低维阈值,低频高维阈值,温度因子
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048),
@@ -107,13 +108,23 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
             rope_scaling.get("beta_slow", 1.0),
             rope_scaling.get("attention_factor", 1.0)
         )
-        # 超过预设范围才会使用YaRN外推
+        # 超过预设范围才会使用YaRN外推,YaRN的核心就是就将原本的freqs划分成低中高频，重新计算其freqs
         if end / orig_max > 1.0:
-                    # 计算波长b对应的维度,匿名函数，波长=2π/θ越短,θ越大,频率越高,维度越低
+                    # 计算波长b对应的维度,匿名函数，波长=2π/θ越大,θ越小,频率越低,维度越高
                     inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
-                    # 计算高低频边界
+                    # 计算高低维边界
                     low, high = (max(math.floor(inv_dim(beta_fast)), 0),
                                  min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1))
+                    #计算ramp即γ,低于low时为负,low~hign之前线性增长，大于hign即大于1
+                    #使用clamp将值裁剪到0 1区间,负数变0,正数变1
+                    # PyTorch要求参与计算的张量在同一设备
                     ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
+                    #计算新频率公式
                     freqs = freqs * (1 - ramp + ramp / factor)
-
+        t = torch.arange(end, device=freqs.device)
+        # 输出 freqs 形状 (end, dim//2)，其中元素 freqs[m, j] = m * θ_j，即位置 m 在第 j 个频率对上的旋转角度（弧度）。
+        freqs = torch.outer(t, freqs).float()
+        # 生成cos、sin查找表
+        freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+        freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+        return freqs_cos, freqs_sin
