@@ -128,3 +128,11 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
         freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
         freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
         return freqs_cos, freqs_sin
+# 一个q对应多个k、v,如q大小为32*n,k大小为8*n,k需要扩展为32*n
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1: return x
+    # 只需要将KV头逻辑上复制n_rep倍,以便与Q的头数对齐,但并不需要提前产生物理上重复的数据
+    return (x[:, :, :, None, :].
+            expand(bs, slen, num_key_value_heads, n_rep, head_dim).
+            reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
