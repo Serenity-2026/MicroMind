@@ -116,11 +116,11 @@ class Attention(nn.Module):
         # 每个头的维度
         self.head_dim = config.head_dim
         self.is_causal = True
-        # Wq、Wk、Wv,得到Q K V 矩阵
+        # Wq、Wk、Wv,得到Q K V 矩阵,如Q的大小为n*维度，(n*hidden_size)*(hidden_size*维度)=n*维度,q_proj表示的就是hidden_size*维度矩阵
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-
+        # output拼接,将维度从config.num_attention_heads * self.head_dim变回hidden_size
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         # 归一化
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
