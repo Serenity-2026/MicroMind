@@ -59,6 +59,7 @@ class RMSNorm(nn.Module):
 # 通过YaRN算法实现对旋转位置编码（RoPE）频率的预计算与扩展,按照低中高维分类讨论
 # dim:模型 hidden size（通常是 attention head 的维度，必须是偶数）
 # end:预计算的最大位置索引，默认 32768。
+# 返回第freqs_cos[pos, d]=位置pos处、第d个特征维度上的余弦值; freqs_sin[pos, d]=位置pos处、第d个特征维度上的 正弦值(乘以了 attn_factor)
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
     # 计算基础角频率,**幂运算,//地板除法
     freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -147,7 +148,9 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xq, xk = self.q_norm(xq), self.k_norm(xk)
+        # 来自precompute_freqs_cis预计算好的正余弦编码
         cos, sin = position_embeddings
+        #RoPE
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
         # KV 缓存处理(增量推理)
         if past_key_value is not None:
