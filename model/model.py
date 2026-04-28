@@ -88,13 +88,16 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
                     ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
                     #计算新频率公式
                     freqs = freqs * (1 - ramp + ramp / factor)
-        t = torch.arange(end, device=freqs.device)
-        # 输出 freqs 形状 (end, dim//2)，其中元素 freqs[m, j] = m * θ_j，即位置 m 在第 j 个频率对上的旋转角度（弧度）。
-        freqs = torch.outer(t, freqs).float()
-        # 生成cos、sin查找表
-        freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
-        freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
-        return freqs_cos, freqs_sin
+    t = torch.arange(end, device=freqs.device)
+    # 输出 freqs 形状 (end, dim//2)，其中元素 freqs[m, j] = m * θ_j，即位置 m 在第 j 个频率对上的旋转角度（弧度）。
+    freqs = torch.outer(t, freqs).float()
+    # 生成cos、sin查找表
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    return freqs_cos, freqs_sin
+
+
+
 # 一个q对应多个k、v,如q大小为32*n,k大小为8*n,k需要扩展为32*n
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, num_key_value_heads, head_dim = x.shape
@@ -103,6 +106,11 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return (x[:, :, :, None, :].
             expand(bs, slen, num_key_value_heads, n_rep, head_dim).
             reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    def rotate_half(x): return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+    q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
+    k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
+    return q_embed, k_embed
 class Attention(nn.Module):
     def __init__(self, config: MicroMindConfig):
         super().__init__()
@@ -129,3 +137,4 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+
