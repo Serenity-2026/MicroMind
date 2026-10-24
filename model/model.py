@@ -47,29 +47,37 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.dim=dim
         self.eps=eps
+        # 为每一个特征生成一个weight[i]，weight为1*n的矩阵，进行乘法操作时向右对齐，自动补全前两维
         self.weight=nn.Parameter(torch.ones(dim))
     # 在 Transformer 模型中，一个批次的数据通常表示为[batch_size, seq_len, d_model]
     # 归一化（无论是 LayerNorm 还是 RMSNorm）的目标是：让每个 token 的特征向量具有稳定的分布，
     # 即特征维度上的各个分量被重新缩放，使它们的均方根（或均值/方差）标准化。
     # 因此，归一化操作必须沿着特征维度（即最后一维 dim=-1） 进行统计计算（均值、方差、RMS 等）
+    # 写 -1 的好处是：无论输入是二维、三维还是四维，都能直接指定最后一维。
+    # 并把这个维度保留为大小 1，方便后续进行广播运算。
     def norm(self,x):
         return x*torch.rsqrt_(x.pow(2).mean(-1,keepdim=True)+self.eps)
     def forward(self,x):
         return (self.weight * self.norm(x.float())).type_as(x)
 # 通过YaRN算法实现对旋转位置编码（RoPE）频率的预计算与扩展,按照低中高维分类讨论
 # 返回的freqs_cos 和 freqs_sin 的形状均为 (end, dim)
-# end:预计算的最大位置索引，默认 32768。
-# dim:模型 hidden size（通常是 attention head 的维度，必须是偶数）
-# 返回第freqs_cos[pos, d]=位置pos处、第d个特征维度上的余弦值; freqs_sin[pos, d]=位置pos处、第d个特征维度上的 正弦值(乘以了 attn_factor)
+# 预先生成 RoPE 使用的 cos、sin 表，还没有用到旋转矩阵
+# | `dim` | 每个注意力头参与旋转的维度,偶数
+# | `end` | 提前计算多少个位置
+# | `rope_base` | 控制各组旋转频率的分布
+# | `rope_scaling` | 可选的 YaRN 配置
+# 返回的是每个token 每个token的每一维度应旋转的sin和cos值
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
-    # 计算基础角频率,**幂运算,//地板除法
-    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    # 温度因子
+    # 计算基础角频率公式,**幂运算
+    freqs = 1.0 / (
+            rope_base ** (torch.arange(0, dim, 2).float() / dim)
+    )
+    # 温度因子，调整旋转结果的幅度，影响注意力分数的尺度，放大注意力分数，softmax更容易集中在高分位置
     attn_factor=1.0
     # 加载核心参数
     # YaRN核心公式，将原始频率f(i) 通过一个线性插值因子 γ（范围 0~1）和缩放因子s（即 factor）来修改。
     if rope_scaling is not None:
-        # 原始支持的最大位置数,放大因子,高频低维阈值,低频高维阈值,温度因子
+        # 原始支持的最大位置数,缩放频率,高频低维阈值,低频高维阈值,温度因子
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048),
             rope_scaling.get("factor", 16),
@@ -80,20 +88,30 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
         # 超过预设范围才会使用YaRN外推,YaRN的核心就是就将原本的freqs划分成低中高频，重新计算其freqs
         if end / orig_max > 1.0:
                     # 计算波长b对应的维度,匿名函数，波长=2π/θ越大,θ越小,频率越低,维度越高
+                    # inv_dim表示：某一对分量在“原上下文长度”内，恰好旋转 b 圈，那么它应该是第几对分量？inv_dim(32)：大约哪一组在原长度内转 32 圈？
                     inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
-                    # 计算高低维边界
+                    # 计算高低维边界，即转32圈和转1圈的组数
                     low, high = (max(math.floor(inv_dim(beta_fast)), 0),
                                  min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1))
-                    #计算ramp即γ,低于low时为负,low~hign之前线性增长，大于hign即大于1
-                    #使用clamp将值裁剪到0 1区间,负数变0,正数变1
+                    # 计算ramp缩放程度,低于low时为负,low~high之前线性增长，大于hign即大于1
+                    # 使用clamp将值裁剪到0 1区间
+                    # 小于 0 → 设为 0
+                    # 大于 1 → 设为 1
+                    # 其余值 → 保持原样
+                    #因为我们希望得到一个 **“当前分组走到了过渡区间的百分之多少” ** 的数值：
+                    #- 到达低边界时，进度是0
+                    #- 到达高边界时，进度是1
+                    #- 中间的位置，线性从0增加到1。
                     # PyTorch要求参与计算的张量在同一设备
                     ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
                     #计算新频率公式
                     freqs = freqs * (1 - ramp + ramp / factor)
+    # 从0开始的位置编号，提前计算的位置，计算要旋转的n*频率
     t = torch.arange(end, device=freqs.device)
-    # 输出 freqs 形状 (end, dim//2)，其中元素 freqs[m, j] = m * θ_j，即位置 m 在第 j 个频率对上的旋转角度（弧度）。
+    # 计算每个位置、每对分量的旋转角度，freqs为一维数组长为dim/2，t为一维数组长度为end，结果freqs为end*dim/2长度的数组
     freqs = torch.outer(t, freqs).float()
-    # 生成cos、sin查找表
+    # 生成cos、sin查找表，torch.cos sin为表里每个值计算正余弦，为什么拼接两遍：
+    # 在此代码中用的是前半段与后半段相匹配的方式，即一个token为[1,2,3,4,5,6],1 4为一组，25 36为一组，没有使用相邻匹配，torch实现更方便
     freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
     return freqs_cos, freqs_sin
@@ -110,7 +128,15 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
             reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 # 旋转位置编码
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    def rotate_half(x): return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+    # ...表示保留前面所有维度，只对最后一维做切片；x.shape[-1] // 2: 表示取最后一维的一半，并且从一半开始切一直到末尾
+    # [1,2,3,4]处理后变为[-3,-4,1,2]，q*cos+rotate_half*sin=[cos-3sin 2cos-4sin 3cos+sin 4cos+2sin],第13项拿出来
+    # 即为[cos-3sin 3cos+sin]相当于[1,3]*旋转矩阵R[[cos,-sin],[sin,cos]]
+    def rotate_half(x):
+        return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+    # unsqueeze 的意思是：给张量插入一个大小为 1 的维度。数值不变，只改变形状，参数表示在哪里添加这个维度，从0开始
+    # [2,4].unsqueeze(1)之后维度变为[2,1,4],unsqueeze(1)=[1,2,4]
+    # 假设q为[2,3,8,6]=>[batch数, token数, 头数, 每头特征数]2条序列 3个token 8个注意力头 嵌入维度为6,
+    # 原本cos为[3,6],cos.unsqueeze后变为[3,1,6],即同一个token的8个头，都使用该位置的同一行cos。
     q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
