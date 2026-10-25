@@ -116,16 +116,6 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
     return freqs_cos, freqs_sin
 
-
-
-# 一个q对应多个k、v,如q大小为32*n,k大小为8*n,k需要扩展为32*n
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    bs, slen, num_key_value_heads, head_dim = x.shape
-    if n_rep == 1: return x
-    # 只需要将KV头逻辑上复制n_rep倍,以便与Q的头数对齐,但并不需要提前产生物理上重复的数据
-    return (x[:, :, :, None, :].
-            expand(bs, slen, num_key_value_heads, n_rep, head_dim).
-            reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 # 旋转位置编码
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     # ...表示保留前面所有维度，只对最后一维做切片；x.shape[-1] // 2: 表示取最后一维的一半，并且从一半开始切一直到末尾
@@ -140,24 +130,44 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
+
+
+# 在gqa中，一个q对应多个k、v以减小内存压力
+# 方法接收的 x 是 K 或 V 张量，形状为：[批次大小, token 数量, KV 头数, 每个头的维度]
+# 如x.shape = [2, 10, 4, 96]表示：一批有 2 条序列，每条有 10 个 token，每个 token 有 4 个 KV 头，每个头是 96 维向量。
+# n_rep表示一个q对应多少kv
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1: return x
+    # x[:, :, :, None, :]增加一维，None 表示在这个位置增加一个大小为 1 的维度。；
+    # expand将增加的一维扩展为n_rep大小,但expand本身共享原来的存储，不会实际复制这几份数据。
+    # reshape合并
+    return (x[:, :, :, None, :].
+            expand(bs, slen, num_key_value_heads, n_rep, head_dim).
+            reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
+
+
 class Attention(nn.Module):
     def __init__(self, config: MicroMindConfig):
         super().__init__()
-        # 未指定num_key_value_heads即退化为标准MHA
+        # 未指定num_key_value_heads即退化为标准MHA,一个q对应一个kv
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
         # q头
         self.n_local_heads = config.num_attention_heads
         # kv头
         self.n_local_kv_heads = self.num_key_value_heads
+        # kv需要复制的个数,n_rep个q共享kv
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        # 每个头的维度
+        # 每个头的维度=hiddenSize/q头数即num_attention_heads
         self.head_dim = config.head_dim
+        # 是否开启因果掩码，掩盖后续token对之前token的影响
         self.is_causal = True
-        # Wq、Wk、Wv,得到Q K V 矩阵,如Q的大小为n*维度，(n*hidden_size)*(hidden_size*维度)=n*维度,q_proj表示的就是hidden_size*维度矩阵
+        # 参数，in_feature（列数） out_feature（输出的行数） 是否使用可训练的偏置值
+        # Linear对最后一维进行变换保留前面的维度，因此输入q[batch_size,seq_length,hidden_size]经过变换后得到[batch_size,seq_length,linear中的out_feature]
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        # output拼接,将维度从config.num_attention_heads * self.head_dim变回hidden_size
+        # 输出投影，学会如何组合不同头的信息.前面的拼接只是把各个头的结果放在一起；o_proj 通过可学习的矩阵，把不同头的信息重新组合
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
         # 归一化
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -166,36 +176,59 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+    #params：
+    #x：RMSNorm处理后后的输入，x.shape=[batch_size, seq_len, hidden_size]
+    # position_embeddings:已处理好的正余弦编码
+    # past_key_value:过去的kv_cache,默认无
+    # use_cache:是否返回更新后的kv_cache
+    # attention_mask:是否使用padding掩码
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        #batch_size sequence_length,x=>[batch_size, seq_len, hidden_size]
         bsz, seq_len, _ = x.shape
-        # 通过投影得到Q K V
+        # 通过投影得到Q K V，Q.shape=[batch_size,seq_len,config.num_attention_heads * self.head_dim]
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        # 拆分最后一维
+        # 拆分最后一维成为多个头
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        #Q、K 的数值大小会影响 softmax 的注意力分布，而 V 不参与 softmax，它负责提供被加权的信息，因此只对 Q、K 额外归一化。
         xq, xk = self.q_norm(xq), self.k_norm(xk)
-        # 来自precompute_freqs_cis预计算好的正余弦编码
+        # 预先计算余弦正弦编码
         cos, sin = position_embeddings
-        #RoPE
+        #应用RoPE，YaRN可选项
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
-        # KV 缓存处理(增量推理)
+        # KV 缓存处理(增量推理)，dim=1 表示沿着序列长度维度拼接。
+        # past_key_value是一个二元组,past_key_value = (
+        #     历史K,
+        #     历史V,
+        # )
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
+        # 后面的@会对张量的最后两个维度做矩阵乘法，希望计算的是“同一个头中，不同 token 之间的匹配分数”。
+        # 现在的维度是[batch_size,seq_length,head,hidden_size],使用transpose=>[batch_size,head,seq_length,hidden_size]
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2),
                       repeat_kv(xv, self.n_rep).transpose(1, 2))
-        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (
-                attention_mask is None or torch.all(attention_mask == 1)):
-            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0,
-                                                    is_causal=self.is_causal)
-        else:
-            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"),
-                                                                        device=scores.device).triu(1)
-            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
-            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        # 使用Attention注意力计算公式计算，k先转置最后两维，前面维度相同会广播
+        scores = (xq @ xk.transpose(-2, -1)).float() / math.sqrt(self.head_dim)
+        # 前一个屏蔽未来 token
+        # 加上因果掩码，torch.full((seq_len, seq_len), float("-inf"),device=scores.device).triu(1)生成负无穷的矩阵后再保留右上角
+        if self.is_causal:
+            # 为什么只选最后 seq_len 列？K 已经拼接了历史缓存，而 seq_len 是本轮输入的 token 数量，不包含历史缓存。
+            # 只对本轮新增的q*kt部分加因果掩码
+            scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"),device=scores.device).triu(1)
+        # 屏蔽用来补齐长度的PAD，一个 batch 中，不同文本的长度可能不同：
+        # 第一条：A B C D
+        # 第二条：E F，一个batch中，不同文本的长度可能不同，为了放进同一个形状规则的张量，需要补齐。例如在左边添加特殊的PAD token，PAD只是占位，不是真正的文本内容。但它也会经过Embedding和Linear，产生K、V，不会天然被注意力忽略。
+        if attention_mask is not None:
+            # 加一个padding掩码矩阵，attention_mask初始大小为[batch_size,seq_len],unsqueeze扩大后成为[batch_size,1,1,seq_len]，seq_leng为kv序列总长度
+            # score大小为[bs,attention_head,seq_len,完整长度(缓存kv的seq+本轮seq)]
+            # 相加时，会在头维度和查询位置维度广播。attention_mask中为0的数表示padding位置，score会加上负无穷
+            scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+        output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
+        #output[bs,a_h,seq_len,hidden_size]=>output[bs,seq_len,a_h,hidden_size]=>output[bs,seq_len,所有的hidden_size]
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        #输出投影，学会如何组合不同头的信息
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
