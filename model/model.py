@@ -3,7 +3,7 @@ import torch.nn.functional as F
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-
+from transformers.activations import ACT2FN
 # 继承Hugging Face transformers库中的 PretrainedConfig，可无缝使用 Hugging Face 的模型存储、加载、from_pretrained 等工具
 class MicroMindConfig(PretrainedConfig):
     model_type = "micromind"
@@ -232,3 +232,16 @@ class Attention(nn.Module):
         #输出投影，学会如何组合不同头的信息
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
+# FFN层，引入非线性能力
+# 输入为Attention处理后的结果,output[bs,seq_len,hidden_size]
+class FeedForward(nn.Module):
+    def __init__(self, config: MicroMindConfig, intermediate_size: int = None):
+        super().__init__()
+        intermediate_size = intermediate_size or config.intermediate_size
+        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
