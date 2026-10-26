@@ -119,8 +119,8 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
 # 旋转位置编码
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     # ...表示保留前面所有维度，只对最后一维做切片；x.shape[-1] // 2: 表示取最后一维的一半，并且从一半开始切一直到末尾
-    # [1,2,3,4]处理后变为[-3,-4,1,2]，q*cos+rotate_half*sin=[cos-3sin 2cos-4sin 3cos+sin 4cos+2sin],第13项拿出来
-    # 即为[cos-3sin 3cos+sin]相当于[1,3]*旋转矩阵R[[cos,-sin],[sin,cos]]
+    # 某一行[q1,q2,q3,q4]处理后变为[-q3,-q4,q1,q2]，q*cos+rotate_half*sin：1 3列为一组，旋转角r相同，只看1 3列：=[q1cosr-q3sinr  q3cosr+q1sinr],第13项拿出来
+    # 相当于旋转矩阵R[[cos,-sin],[sin,cos]]*[[q1],[q3]]
     def rotate_half(x):
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
     # unsqueeze 的意思是：给张量插入一个大小为 1 的维度。数值不变，只改变形状，参数表示在哪里添加这个维度，从0开始
@@ -175,7 +175,6 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
     #params：
     #x：RMSNorm处理后后的输入，x.shape=[batch_size, seq_len, hidden_size]
     # position_embeddings:已处理好的正余弦编码
@@ -245,3 +244,29 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+class MiniMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MicroMindConfig):
+        super().__init__()
+        self.self_attn = Attention(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config)
+    # hidden_states	本轮输入的 token 向量，形状 [B,T,768]
+    # position_embeddings	本轮位置对应的 (cos, sin)
+    # past_key_value	当前这个 Block 的历史 (K,V)
+    # use_cache	是否返回更新后的 KV cache
+    # attention_mask	标记有效位置与 padding 的掩码
+    def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
+        # 残差，保存原有数据
+        residual = hidden_states
+        #Attention层处理
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states), position_embeddings,
+            past_key_value, use_cache, attention_mask
+        )
+        # 残差连接
+        hidden_states += residual
+        # 残差连接+FFN
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_key_value
