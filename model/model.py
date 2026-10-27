@@ -269,4 +269,63 @@ class MiniMindBlock(nn.Module):
         hidden_states += residual
         # 残差连接+FFN
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        #返回的是通过该层后的状态及kv cache
         return hidden_states, present_key_value
+#创建 Embedding、多个 Block、最终 RMSNorm 和 RoPE 表，然后在 forward 中按顺序调用它们。
+class MiniMindModel(nn.Module):
+    def __init__(self, config: MicroMindConfig):
+        super().__init__()
+        self.config = config
+        #模型词表大小与隐藏层个数，一共给6400个词打分
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        #创建词嵌入矩阵，随训练一起更新
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        #　attention + ffn为一层，layers一共8层
+        self.layers = nn.ModuleList([MiniMindBlock(l, config)
+                                     for l in range(self.num_hidden_layers)])
+        #这是八个 Block 全部执行完之后使用的 Norm，与每个 Block 内部的 Norm 是不同实例。
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        #所有attention层共享旋转角度，但是旋转后结果不同由各自的qkv控制
+        freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
+        # self.register_buffer将cos和sin表交给pytorch统一管理,运行时保留并使用，随模型迁移设备；保存 state_dict() 时省略，因为是直接按照公式计算出来的不用保存，重新创建模型时再计算。
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    # input_ids:传入token_id及在词表中的编号，[batch_size, seq_length]，此时还没做嵌入
+    # attention_mask:padding掩码，0表示无效，对应位置注意力分数会被置于负无穷
+    # past_key_values；各层kv cache缓存
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, **kwargs):
+        batch_size, seq_length = input_ids.shape
+        # 识别并丢弃当前实现没有适配的缓存格式，pytorch存储kvcache的属性有layers，识别到直接丢弃
+        if hasattr(past_key_values, 'layers'): past_key_values = None
+        # 第一次没有历史缓存时，得到[
+        #     None,  # Block 0
+        #     None,  # Block 1
+        #     None,  # Block 2
+        #     None,  # Block 3
+        #     None,  # Block 4
+        #     None,  # Block 5
+        #     None,  # Block 6
+        #     None,  # Block 7
+        # ]
+        past_key_values = past_key_values or [None] * len(self.layers)
+        # 确定：本轮输入的 token，位置编号应该从哪里开始。past_key_values[0][0]即缓存的key，shape为[bs,sl,kv,hidden_size]，这里是在取sequence length
+        # 为什么要取：因为 RoPE 表提前存好了很多位置的旋转系数，而本轮只需要用到当前 token 对应的几行。
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        # 取对应位置的sin cos表
+        position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
+        presents = []
+        # zip() 的作用是：把多个序列中相同位置的元素配成一组，将layer层 以及对应的past kv cache配置成一组
+        for layer, past_key_value in zip(self.layers, past_key_values):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+            presents.append(present)
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, presents
