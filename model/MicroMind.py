@@ -1,9 +1,14 @@
 import math
 import torch.nn.functional as F
 import torch
+from sympy.parsing.sympy_parser import null
 from torch import nn
 from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
+
+
 # 继承Hugging Face transformers库中的 PretrainedConfig，可无缝使用 Hugging Face 的模型存储、加载、from_pretrained 等工具
 class MicroMindConfig(PretrainedConfig):
     model_type = "micromind"
@@ -245,7 +250,7 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
-class MiniMindBlock(nn.Module):
+class MicroMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MicroMindConfig):
         super().__init__()
         self.self_attn = Attention(config)
@@ -272,7 +277,7 @@ class MiniMindBlock(nn.Module):
         #返回的是通过该层后的状态及kv cache
         return hidden_states, present_key_value
 #创建 Embedding、多个 Block、最终 RMSNorm 和 RoPE 表，然后在 forward 中按顺序调用它们。
-class MiniMindModel(nn.Module):
+class MicroMindModel(nn.Module):
     def __init__(self, config: MicroMindConfig):
         super().__init__()
         self.config = config
@@ -282,7 +287,7 @@ class MiniMindModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         #　attention + ffn为一层，layers一共8层
-        self.layers = nn.ModuleList([MiniMindBlock(l, config)
+        self.layers = nn.ModuleList([MicroMindBlock(l, config)
                                      for l in range(self.num_hidden_layers)])
         #这是八个 Block 全部执行完之后使用的 Norm，与每个 Block 内部的 Norm 是不同实例。
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -329,3 +334,64 @@ class MiniMindModel(nn.Module):
             presents.append(present)
         hidden_states = self.norm(hidden_states)
         return hidden_states, presents
+
+#标准化封装模型，PreTrainedModel 提供模型配置、保存和加载等框架能力；GenerationMixin 提供生成相关接口。
+class MicroMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MicroMindConfig
+    def __init__(self, config: MicroMindConfig = None):
+        self.config = config or MicroMindConfig()
+        super().__init__(self.config)
+        self.model = MicroMindModel(self.config)
+        # 语言层映射，将隐藏向量映射为词表中各 token 的原始分数 logits
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # 权重共享，输出层和输入层的词嵌入矩阵共享
+        self.model.embed_tokens.weight = self.lm_head.weight
+        self.post_init()
+    # logits_to_keep:要保留的logits数量，默认为0
+    # labels:正确答案，用于计算loss，二维矩阵，batch*seq_length
+    def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0,labels=None,
+                 **kwargs):
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **kwargs)
+        # 经过 lm_head 后，每个位置都会得到一组词表分数，如序列ABCD：
+        # hA → 用于预测 B
+        # hB → 用于预测 C
+        # hC → 用于预测 D
+        # hD → 用于预测下一个 token
+        # 训练时，我们希望同时训练多个位置的预测，所以通常需要保留全部位置的 logits。
+        # 生成下一个 token 时，只需要最后一个位置 hD 对应的 logits，就可以选择 D 后面接什么。
+        # 因此，可以只计算：self.lm_head(hD)
+        # 而不必把 hA、hB、hC 都送入输出层。这能减少输出层的计算和 logits 占用的内存，尤其词表很大时。
+        # 如果传入的logits_to_keep是int类型即数字，就保留后logits_to_keep个数字（0表示无规则，-1表示取最后1个）；如果传入的是规则则使用
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        loss = None
+        # 计算训练误差，logits先去掉最后一个预测，labels去掉第一个正确答案，因为位置0的词表分数做的是第一个词的预测
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # shift_logits和shift_labels都被展平，shift_logits形状为[bs*se,词表大小],shift_labels大小为[bs*se]
+            # F.cross_entropy计算得的是正确答案的概率对应的损失，等价于:
+            # 1. 计算每个 token 的对数概率
+            # log_probs = F.log_softmax(logits, dim=-1)
+            # # 2. 根据 labels 取出正确 token 的对数概率，取负并求平均
+            # loss = F.nll_loss(log_probs, labels, ignore_index=-100)
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-100,
+            )
+        output = CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states
+        )
+        return output
+
+
+
